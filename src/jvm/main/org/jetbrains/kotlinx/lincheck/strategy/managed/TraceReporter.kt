@@ -31,6 +31,15 @@ internal fun StringBuilder.appendTrace(
     appendShortTrace(startTraceGraphNode, failure)
     appendExceptionsStackTracesBlock(exceptionStackTraces)
     appendDetailedTrace(startTraceGraphNode, failure)
+    appendLine()
+    appendShortTraceForLLM(startTraceGraphNode, failure, false)
+    appendLine()
+    appendDetailedTraceForLLM(startTraceGraphNode, failure, false)
+    appendLine()
+//    appendShortTraceForLLM(startTraceGraphNode, failure, true)
+//    appendLine()
+//    appendDetailedTraceForLLM(startTraceGraphNode, failure, true)
+//    appendLine()
 }
 
 /**
@@ -64,6 +73,36 @@ private fun StringBuilder.appendDetailedTrace(
     }
 }
 
+/**
+ * @param sectionsFirstNodes a list of first nodes in each scenario section
+ */
+private fun StringBuilder.appendShortTraceForLLM(
+    sectionsFirstNodes: List<TraceNode>,
+    failure: LincheckFailure,
+    compact_format: Boolean
+) {
+    appendLine(SHORT_LLM_TRACE_TITLE + (if (compact_format) "(compact format)" else ""))
+    val traceRepresentation = traceGraphToRepresentationForLLMList(sectionsFirstNodes, false, compact_format)
+    appendTraceRepresentationForLLM(traceRepresentation)
+    if (failure is ManagedDeadlockFailure || failure is TimeoutFailure) {
+        appendLine(ALL_UNFINISHED_THREADS_IN_DEADLOCK_MESSAGE)
+    }
+}
+
+private fun StringBuilder.appendDetailedTraceForLLM(
+    sectionsFirstNodes: List<TraceNode>,
+    failure: LincheckFailure,
+    compact_format: Boolean
+) {
+    appendLine(DETAILED_LLM_TRACE_TITLE + (if (compact_format) "(compact format)" else ""))
+    val traceRepresentationVerbose = traceGraphToRepresentationForLLMList(sectionsFirstNodes, true, compact_format)
+    appendTraceRepresentationForLLM(traceRepresentationVerbose)
+    if (failure is ManagedDeadlockFailure || failure is TimeoutFailure) {
+        appendLine(ALL_UNFINISHED_THREADS_IN_DEADLOCK_MESSAGE)
+    }
+}
+
+
 private fun StringBuilder.appendTraceRepresentation(
     scenario: ExecutionScenario,
     traceRepresentation: List<List<TraceEventRepresentation>>
@@ -76,6 +115,17 @@ private fun StringBuilder.appendTraceRepresentation(
         traceRepresentationSplitted.forEach { section ->
             appendColumns(section.columns)
             appendSeparatorLine()
+        }
+    }
+}
+
+
+private fun StringBuilder.appendTraceRepresentationForLLM(
+    traceRepresentation: List<List<TraceEventRepresentation>>
+) {
+    traceRepresentation.forEach { section ->
+        section.forEach { event ->
+            appendLine(event.representation)
         }
     }
 }
@@ -239,6 +289,7 @@ internal fun constructTraceGraph(
                 iThread = iThread,
                 last = lastEvent,
                 callDepth = callDepth,
+                actorRepresentation = actorRepresentations[iThread][actorId],
                 resultRepresentation = resultRepresentation,
                 exceptionNumberIfExceptionResult = if (result is ExceptionResult) exceptionStackTraces[result.throwable]?.number else null
             )
@@ -345,6 +396,23 @@ private fun traceGraphToRepresentationList(
         }
     }
 
+/**
+ * @param sectionsFirstNodes a list of first nodes in each scenario section
+ */
+private fun traceGraphToRepresentationForLLMList(
+    sectionsFirstNodes: List<TraceNode>,
+    verboseTrace: Boolean,
+    compact_format: Boolean
+): List<List<TraceEventRepresentation>> =
+    sectionsFirstNodes.map { firstNodeInSection ->
+        buildList {
+            var curNode: TraceNode? = firstNodeInSection
+            while (curNode != null) {
+                curNode = curNode.addRepresentationForLLMTo(this, verboseTrace, compact_format)
+            }
+        }
+    }
+
 internal sealed class TraceNode(
     private val prefixProvider: PrefixProvider,
     val iThread: Int,
@@ -376,6 +444,15 @@ internal sealed class TraceNode(
     abstract fun addRepresentationTo(
         traceRepresentation: MutableList<TraceEventRepresentation>,
         verboseTrace: Boolean
+    ): TraceNode?
+
+    /**
+     * Adds this node representation to the [traceRepresentation] and returns the next node to be processed.
+     */
+    abstract fun addRepresentationForLLMTo(
+        traceRepresentation: MutableList<TraceEventRepresentation>,
+        verboseTrace: Boolean,
+        compact_format: Boolean
     ): TraceNode?
 
     protected fun stateEventRepresentation(iThread: Int, stateRepresentation: String) =
@@ -414,6 +491,23 @@ internal class TraceLeafEvent(
     ): TraceNode? {
         val representation = prefix + event.toString()
         traceRepresentation.add(TraceEventRepresentation(iThread, representation))
+        return next
+    }
+
+    override fun addRepresentationForLLMTo(
+        traceRepresentation: MutableList<TraceEventRepresentation>,
+        verboseTrace: Boolean,
+        compact_format: Boolean
+    ): TraceNode? {
+        if (verboseTrace) {
+            val representation = if (compact_format) {
+                if (event is SwitchEventTracePoint) "switch to thread ${next?.let { it.iThread + 1 } ?: "?"}" else "${iThread + 1}:" + prefix + event.toString()
+            }
+            else {
+                if (event is SwitchEventTracePoint) "switch to thread ${next?.let { it.iThread + 1 } ?: "?"}" else prefix + event.toString()
+            }
+            traceRepresentation.add(TraceEventRepresentation(iThread, representation))
+        }
         return next
     }
 }
@@ -461,6 +555,16 @@ internal class CallNode(
             traceRepresentation.add(TraceEventRepresentation(iThread, prefix + "$call"))
             next
         }
+
+    override fun addRepresentationForLLMTo(
+        traceRepresentation: MutableList<TraceEventRepresentation>,
+        verboseTrace: Boolean,
+        compact_format: Boolean
+    ): TraceNode? {
+            if (verboseTrace)
+                traceRepresentation.add(TraceEventRepresentation(iThread, if (compact_format) "${iThread + 1}:" + prefix + "$call" else prefix + "$call"))
+            return next
+        }
 }
 
 internal class ActorNode(
@@ -484,6 +588,17 @@ internal class ActorNode(
             next
         }
     }
+    override fun addRepresentationForLLMTo(
+        traceRepresentation: MutableList<TraceEventRepresentation>,
+        verboseTrace: Boolean,
+        compact_format: Boolean
+    ): TraceNode? {
+        if (compact_format)
+            traceRepresentation.add(TraceEventRepresentation(iThread, "${iThread + 1}:$actorRepresentation started"))
+        else
+            traceRepresentation.add(TraceEventRepresentation(iThread, "$actorRepresentation in thread ${iThread + 1} started"))
+        return next
+    }
 }
 
 internal class ActorResultNode(
@@ -491,6 +606,7 @@ internal class ActorResultNode(
     iThread: Int,
     last: TraceNode?,
     callDepth: Int,
+    internal val actorRepresentation: String,
     internal val resultRepresentation: String?,
     /**
      * This value presents only if an exception was the actor result.
@@ -507,6 +623,23 @@ internal class ActorResultNode(
     ): TraceNode? {
         if (resultRepresentation != null)
             traceRepresentation.add(TraceEventRepresentation(iThread, prefix + "result: $resultRepresentation"))
+        return next
+    }
+
+    override fun addRepresentationForLLMTo(
+        traceRepresentation: MutableList<TraceEventRepresentation>,
+        verboseTrace: Boolean,
+        compact_format: Boolean
+    ): TraceNode? {
+        if (resultRepresentation != null) {
+            if (compact_format)
+                traceRepresentation.add(TraceEventRepresentation(iThread, "${iThread + 1}:$actorRepresentation finished with result: $resultRepresentation"))
+            else
+                traceRepresentation.add(TraceEventRepresentation(iThread, "$actorRepresentation in thread ${iThread + 1} finished with result: $resultRepresentation"))
+        }
+        if (verboseTrace && next != null && iThread != next?.iThread) {
+            traceRepresentation.add(TraceEventRepresentation(iThread, "switch to thread ${next?.let { it.iThread + 1 } ?: "?"}"))
+        }
         return next
     }
 }
@@ -642,4 +775,6 @@ internal class TraceEventRepresentation(val iThread: Int, val representation: St
 
 const val TRACE_TITLE = "The following interleaving leads to the error:"
 const val DETAILED_TRACE_TITLE = "Detailed trace:"
+const val SHORT_LLM_TRACE_TITLE = "Short LLM trace:"
+const val DETAILED_LLM_TRACE_TITLE = "Detailed LLM trace:"
 private const val ALL_UNFINISHED_THREADS_IN_DEADLOCK_MESSAGE = "All unfinished threads are in deadlock"
